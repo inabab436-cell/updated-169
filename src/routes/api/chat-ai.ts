@@ -1756,10 +1756,19 @@ export const Route = createFileRoute("/api/chat-ai")({
                       id: String(p.id),
                       name: String(p.name ?? ""),
                       price: (p as any).price ?? null,
+                      // Real availability: an offer the stock can never reach
+                      // must never be dangled in front of the customer.
+                      stock: Array.isArray((p as any).variants)
+                        ? (p as any).variants.reduce(
+                            (s: number, v: any) => s + (Number(v?.stock) > 0 ? Number(v.stock) : 0),
+                            0,
+                          )
+                        : null,
                     })),
                   ),
                   currency,
                 );
+
               } catch (e) {
                 console.error("[chat-ai] offers read skipped");
               }
