@@ -49,7 +49,8 @@ export function stripPhotoPromise(text: string | null | undefined): string {
   if (!text) return "";
   const kept = splitSentences(text).filter((s) => !sentencePromisesPhoto(s));
   return kept
-    .join("")
+    .map((s) => s.trimEnd())
+    .join(" ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
