@@ -4356,25 +4356,27 @@ export const Route = createFileRoute("/api/chat-ai")({
                 : `رقم الأوردر: ${createdOrderNumber}`;
             } else if (needsHumanNow) {
               reply = "تمام يا فندم، هحوّلك دلوقتي للمسؤول.";
-            } else if (agentAttachments.length > 0) {
-              // Photos are being sent: never pin the "rephrase" line under them.
-              reply = "اتفضل يا فندم الصور 👌 تحب أعرفك على المقاسات والألوان المتاحة؟";
             } else {
-              // No stored sentence: ask the model to actually answer the
-              // customer from this same context. If even that produces nothing,
-              // the request is beyond what the agent can technically do: no
-              // sentence is sent, the merchant is notified instead.
+              // No stored sentence — including the case where photos are being
+              // sent. There is NO canned caption any more: a fixed sentence
+              // pinned under the images never followed the conversation. The
+              // model writes the line itself, in the same context that already
+              // carries the attachment facts.
               const { regenerateCustomerReply } = await import("@/lib/reply-regeneration.server");
               const regenerated = sanitizeAssistantReply(
                 await regenerateCustomerReply(lovableApiKey as string, aiMessages as any),
               ).trim();
               if (regenerated) {
                 reply = regenerated;
+              } else if (agentAttachments.length > 0) {
+                // The images still go out on their own, with no invented text.
+                reply = "";
               } else {
                 reply = "";
                 capabilityBlocked = true;
               }
             }
+
 
           }
 
