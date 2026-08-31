@@ -3385,11 +3385,16 @@ export const Route = createFileRoute("/api/chat-ai")({
                     shipping_cost: shippingCost,
                     discount_amount: pricing.discount_total,
                     subtotal_price: pricing.subtotal,
+                    // Remember WHICH offers were applied, so the redemption
+                    // counter never depends on the offer still being live at
+                    // payment-confirmation time.
+                    applied_offer_ids: pricing.applied_offers.map((o) => o.offer_id),
                   })
                   .eq("order_number", orderNumber);
               } catch {
                 /* breakdown columns not present yet */
               }
+
             }
 
             // The order exists: every field it carries becomes COMMITTED and
