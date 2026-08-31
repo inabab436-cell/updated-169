@@ -12,6 +12,8 @@ import {
   buildAttachmentContextMessage,
   needsAttachmentAwareRegeneration,
 } from "@/lib/reply-attachment-context";
+import { replyPromisesPhoto, stripPhotoPromise } from "@/lib/photo-promise-guard";
+
 import {
   describeLocationsForModel,
   isLocationAttachment,
