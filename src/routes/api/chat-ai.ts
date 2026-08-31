@@ -1756,10 +1756,19 @@ export const Route = createFileRoute("/api/chat-ai")({
                       id: String(p.id),
                       name: String(p.name ?? ""),
                       price: (p as any).price ?? null,
+                      // Real availability: an offer the stock can never reach
+                      // must never be dangled in front of the customer.
+                      stock: Array.isArray((p as any).variants)
+                        ? (p as any).variants.reduce(
+                            (s: number, v: any) => s + (Number(v?.stock) > 0 ? Number(v.stock) : 0),
+                            0,
+                          )
+                        : null,
                     })),
                   ),
                   currency,
                 );
+
               } catch (e) {
                 console.error("[chat-ai] offers read skipped");
               }
@@ -2160,7 +2169,15 @@ export const Route = createFileRoute("/api/chat-ai")({
             // NEAR-MISS: how many MORE of the same eligible product unlock the
             // offer, and what the customer would pay then. Computed here so the
             // agent never has to reason about it (and never stays silent).
-            const { unitsToReachMinimum } = await import("@/lib/offer-upsell");
+            const { unitsToReachMinimum, usageNoteFor } = await import("@/lib/offer-upsell");
+            const stockOf = (pid: string): number | null => {
+              const p: any = merchantData.products.find((x: any) => String(x.id) === String(pid));
+              if (!p || !Array.isArray(p.variants)) return null;
+              return p.variants.reduce(
+                (s: number, v: any) => s + (Number(v?.stock) > 0 ? Number(v.stock) : 0),
+                0,
+              );
+            };
             const near_miss = quote.offers
               .filter((e) => e.reason === "eligible_subtotal_below_minimum" && e.product_id)
               .map((e) => {
@@ -2169,10 +2186,14 @@ export const Route = createFileRoute("/api/chat-ai")({
                 const extra = unitsToReachMinimum(unit, e.shortfall);
                 if (!extra) return null;
                 const newQty = (line?.quantity ?? 0) + extra;
+                // Never dangle a discount the stock cannot deliver.
+                const stock = stockOf(String(e.product_id));
+                if (stock != null && newQty > stock) return null;
                 const newLines = lines.map((l) =>
                   l.product_id === String(e.product_id) ? { ...l, quantity: newQty } : l,
                 );
                 const better = quoteCart(liveOffers, newLines, currency);
+                const offerRow = liveOffers.find((o) => o.id === e.offer_id);
                 return {
                   offer_id: e.offer_id,
                   title: e.title,
@@ -2182,9 +2203,12 @@ export const Route = createFileRoute("/api/chat-ai")({
                   shortfall: e.shortfall,
                   extra_units_needed: extra,
                   quantity_that_unlocks: newQty,
+                  stock_available: stock,
                   subtotal_if_taken: better.subtotal,
                   discount_if_taken: better.discount_total,
                   total_if_taken: better.total,
+                  saving_if_taken: better.discount_total,
+                  usage_note: offerRow ? usageNoteFor(offerRow) : null,
                 };
               })
               .filter(Boolean);
@@ -2197,11 +2221,13 @@ export const Route = createFileRoute("/api/chat-ai")({
                 rule:
                   "The numbers above are final. Prices of products outside a product-scoped offer are NEVER counted toward its minimum and NEVER discounted. Do not recompute, do not round differently, and never suggest adding a non-eligible product to reach an offer minimum." +
                   (near_miss.length
-                    ? " near_miss is MANDATORY to mention once, in one short sentence, using these exact numbers: say the offer exists, that the current request is below its minimum, and what the discount and the total would be at quantity_that_unlocks. Offer it as a free choice, never insist, never repeat it, and if the customer declines continue with the original quantity at full price."
+                    ? " near_miss is MANDATORY to mention once, in one short natural sentence framed as a useful CHOICE (never as a bare condition): state the price of what they asked for, then that taking quantity_that_unlocks costs total_if_taken with a saving of saving_if_taken, plus usage_note when it says once per customer. Never insist, never repeat it, and if the customer declines continue with the original quantity at full price. near_miss entries already respect the real stock; an offer not listed here must never be mentioned."
                     : "") +
                   " Whatever total you state to the customer must be exactly the total field above, in this message and in every later message including the final confirmation.",
               },
             };
+
+
 
           }
 
@@ -3359,11 +3385,16 @@ export const Route = createFileRoute("/api/chat-ai")({
                     shipping_cost: shippingCost,
                     discount_amount: pricing.discount_total,
                     subtotal_price: pricing.subtotal,
+                    // Remember WHICH offers were applied, so the redemption
+                    // counter never depends on the offer still being live at
+                    // payment-confirmation time.
+                    applied_offer_ids: pricing.applied_offers.map((o) => o.offer_id),
                   })
                   .eq("order_number", orderNumber);
               } catch {
                 /* breakdown columns not present yet */
               }
+
             }
 
             // The order exists: every field it carries becomes COMMITTED and

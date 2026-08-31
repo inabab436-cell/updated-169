@@ -101,9 +101,12 @@ export async function recordOfferRedemptionsForOrders(
     if (!userId) return 0;
 
     const { data: offerRows } = await admin.from("offers").select("*").eq("user_id", userId);
-    const offers = ((offerRows ?? []) as Record<string, unknown>[])
-      .map(mapOfferRow)
-      .filter((o) => isLive(o));
+    // NOT filtered by isLive: an offer that expired or sold out between the
+    // order and the merchant's payment confirmation was still really used by
+    // the customer, and must still be counted. Liveness is judged against the
+    // order's own creation time instead (or skipped when the order itself
+    // records which offers were applied).
+    const offers = ((offerRows ?? []) as Record<string, unknown>[]).map(mapOfferRow);
     if (!offers.length) return 0;
 
     const productIds = offers.map((o) => o.product_id).filter(Boolean) as string[];
@@ -113,32 +116,62 @@ export async function recordOfferRedemptionsForOrders(
       for (const p of (prods ?? []) as any[]) names.set(String(p.id), String(p.name ?? ""));
     }
 
-    const { data: orders } = await admin
-      .from("orders")
-      .select(
-        "id, conversation_id, customer_id, customer_phone, customer_name, total_price, items, payment_status",
-      )
-      .in("id", ids);
+    let ordersSelect =
+      "id, conversation_id, customer_id, customer_phone, customer_name, total_price, items, payment_status, created_at, applied_offer_ids";
+    let ordersRes = await admin.from("orders").select(ordersSelect).in("id", ids);
+    if (ordersRes.error) {
+      // Older databases without the applied_offer_ids column.
+      ordersSelect =
+        "id, conversation_id, customer_id, customer_phone, customer_name, total_price, items, payment_status, created_at";
+      ordersRes = await admin.from("orders").select(ordersSelect).in("id", ids);
+    }
+    const orders = ordersRes.data;
 
     let recorded = 0;
+    const touched = new Set<string>();
     for (const order of ((orders ?? []) as Record<string, unknown>[])) {
       // Belt and braces: never count an order that is not actually paid.
       if (String(order.payment_status ?? "confirmed") === "pending") continue;
       const customerKey = customerKeyOf(order);
-      for (const offer of offers) {
-        const pname = offer.product_id ? names.get(offer.product_id) ?? null : null;
-        if (!offerAppliesToOrder(offer, pname, order)) continue;
+      const orderedAt = Date.parse(String(order.created_at ?? "")) || Date.now();
+      const applied = Array.isArray(order.applied_offer_ids)
+        ? (order.applied_offer_ids as unknown[]).map(String).filter(Boolean)
+        : [];
+
+      const candidates = applied.length
+        ? offers.filter((o) => applied.includes(o.id))
+        : offers.filter((o) => {
+            // The offer must have been usable when the order was placed…
+            if (!isLive(o, orderedAt) && !isLive(o)) return false;
+            const pname = o.product_id ? names.get(o.product_id) ?? null : null;
+            return offerAppliesToOrder(o, pname, order);
+          });
+
+      for (const offer of candidates) {
+        // Existing rows for this offer decide both usage limits below.
+        const { data: existing } = await admin
+          .from("offer_redemptions")
+          .select("customer_key, order_id")
+          .eq("offer_id", offer.id);
+        const rows = (existing ?? []) as any[];
+        const beneficiaries = new Set(rows.map((r) => String(r.customer_key ?? r.order_id)));
+        const alreadyUsed = beneficiaries.has(customerKey);
 
         // "Once per customer": a customer who already benefited is never
         // counted again, and the offer simply does not apply to that order.
-        const { data: prior } = await admin
-          .from("offer_redemptions")
-          .select("id")
-          .eq("offer_id", offer.id)
-          .eq("customer_key", customerKey)
-          .limit(1);
-        const alreadyUsed = ((prior ?? []) as any[]).length > 0;
         if (offer.usage_limit_type === "once_per_customer" && alreadyUsed) continue;
+
+        // Global cap: a NEW beneficiary can never push the offer past its
+        // maximum number of beneficiaries (existing ones may still reorder
+        // when the offer is per-order).
+        if (
+          offer.max_redemptions != null &&
+          offer.max_redemptions > 0 &&
+          !alreadyUsed &&
+          beneficiaries.size >= offer.max_redemptions
+        ) {
+          continue;
+        }
 
         const { error } = await admin.from("offer_redemptions").insert({
           offer_id: offer.id,
@@ -152,22 +185,25 @@ export async function recordOfferRedemptionsForOrders(
         // the counters are still refreshed below so a previous half-finished
         // run can never leave the offer counter behind.
         if (!error) recorded += 1;
-
-        // Uses = every recorded row. Beneficiaries = unique customers.
-        const { data: allRows } = await admin
-          .from("offer_redemptions")
-          .select("customer_key, order_id")
-          .eq("offer_id", offer.id);
-        const rows = (allRows ?? []) as any[];
-        const uniq = new Set(rows.map((r) => String(r.customer_key ?? r.order_id)));
-        await admin
-          .from("offers")
-          .update({ redemption_count: rows.length, beneficiary_count: uniq.size })
-          .eq("id", offer.id);
-
+        touched.add(offer.id);
       }
     }
+
+    // Uses = every recorded row. Beneficiaries = unique customers.
+    for (const offerId of touched) {
+      const { data: allRows } = await admin
+        .from("offer_redemptions")
+        .select("customer_key, order_id")
+        .eq("offer_id", offerId);
+      const rows = (allRows ?? []) as any[];
+      const uniq = new Set(rows.map((r) => String(r.customer_key ?? r.order_id)));
+      await admin
+        .from("offers")
+        .update({ redemption_count: rows.length, beneficiary_count: uniq.size })
+        .eq("id", offerId);
+    }
     return recorded;
+
   } catch {
     return 0;
   }
