@@ -12,6 +12,8 @@ import {
   buildAttachmentContextMessage,
   needsAttachmentAwareRegeneration,
 } from "@/lib/reply-attachment-context";
+import { replyPromisesPhoto, stripPhotoPromise } from "@/lib/photo-promise-guard";
+
 import {
   describeLocationsForModel,
   isLocationAttachment,
@@ -4356,27 +4358,79 @@ export const Route = createFileRoute("/api/chat-ai")({
                 : `رقم الأوردر: ${createdOrderNumber}`;
             } else if (needsHumanNow) {
               reply = "تمام يا فندم، هحوّلك دلوقتي للمسؤول.";
-            } else if (agentAttachments.length > 0) {
-              // Photos are being sent: never pin the "rephrase" line under them.
-              reply = "اتفضل يا فندم الصور 👌 تحب أعرفك على المقاسات والألوان المتاحة؟";
             } else {
-              // No stored sentence: ask the model to actually answer the
-              // customer from this same context. If even that produces nothing,
-              // the request is beyond what the agent can technically do: no
-              // sentence is sent, the merchant is notified instead.
+              // No stored sentence — including the case where photos are being
+              // sent. There is NO canned caption any more: a fixed sentence
+              // pinned under the images never followed the conversation. The
+              // model writes the line itself, in the same context that already
+              // carries the attachment facts.
               const { regenerateCustomerReply } = await import("@/lib/reply-regeneration.server");
               const regenerated = sanitizeAssistantReply(
                 await regenerateCustomerReply(lovableApiKey as string, aiMessages as any),
               ).trim();
               if (regenerated) {
                 reply = regenerated;
+              } else if (agentAttachments.length > 0) {
+                // The images still go out on their own, with no invented text.
+                reply = "";
               } else {
                 reply = "";
                 capabilityBlocked = true;
               }
             }
 
+
           }
+
+          // ---------------------------------------------------------------
+          // PHOTO-PROMISE GUARD
+          // ---------------------------------------------------------------
+          // Root cause of two observed defects:
+          //  * the reply announced a photo ("هبعتلك الصورة") in a turn where
+          //    nothing was attached — attachments only ever leave WITH the
+          //    reply, so that promise could never be kept;
+          //  * the same announcement was repeated while the images were
+          //    already attached, which reads like a bot with no awareness of
+          //    what it just sent.
+          // Either way the sentence about the ACT of sending is removed. When
+          // nothing is attached yet, we first try to actually attach the photo
+          // of the product this turn is about, so the customer gets the image
+          // instead of a broken promise.
+          if (reply && replyPromisesPhoto(reply)) {
+            if (agentAttachments.length === 0) {
+              const target =
+                showableProductId(merchantData.products, matchedProductId) ??
+                (findNamedProduct(
+                  [message, reply],
+                  merchantData.products as any[],
+                  (p: any) => isProductShowable(p),
+                ) as { id: string } | null)?.id ??
+                null;
+              if (target) {
+                const color = requestedColorFor(target);
+                await executeAttachProductMedia(
+                  JSON.stringify({ product_id: target, limit: 4, ...(color ? { color } : {}) }),
+                );
+              }
+            }
+            const stripped = stripPhotoPromise(reply);
+            if (stripped) {
+              reply = stripped;
+            } else if (agentAttachments.length === 0) {
+              // The whole reply was the promise and no image exists: ask the
+              // model for a real answer instead of shipping an empty turn.
+              const { regenerateCustomerReply } = await import("@/lib/reply-regeneration.server");
+              const regenerated = sanitizeAssistantReply(
+                await regenerateCustomerReply(lovableApiKey as string, aiMessages as any),
+              ).trim();
+              reply = stripPhotoPromise(regenerated);
+            } else {
+              // Images are going out; no invented caption replaces the promise.
+              reply = "";
+            }
+          }
+
+
 
           // ---------------------------------------------------------------
           // MISSING-INFORMATION TRUTH GUARD
