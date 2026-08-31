@@ -22,6 +22,8 @@ export interface UpsellProduct {
   id: string;
   name: string | null;
   price: number | null;
+  /** Total units really available right now across all variants. */
+  stock?: number | null;
 }
 
 export interface OfferUpsell {
@@ -36,6 +38,12 @@ export interface OfferUpsell {
   subtotal_at_units: number;
   discount_at_units: number;
   total_at_units: number;
+  /** Units really available. null when unknown. */
+  stock_available: number | null;
+  /** False when the stock can never reach the minimum → never mention it. */
+  reachable: boolean;
+  /** How the customer must be told about it. */
+  usage_note: string;
 }
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
@@ -47,9 +55,25 @@ function discountFor(offer: OfferRow, subtotal: number): number {
   return round2(Math.min(Math.max(raw, 0), subtotal));
 }
 
+/** Short, honest sentence about how often the customer may use the offer. */
+export function usageNoteFor(offer: OfferRow): string {
+  const once = offer.usage_limit_type === "once_per_customer";
+  const remaining =
+    offer.max_redemptions != null && offer.max_redemptions > 0
+      ? Math.max(0, offer.max_redemptions - offer.beneficiary_count)
+      : null;
+  const parts: string[] = [
+    once ? "مرة واحدة لكل عميل" : "ينطبق على كل طلب للعميل",
+  ];
+  if (remaining != null) parts.push(`متبقي ${remaining} عميل من أصل ${offer.max_redemptions}`);
+  return parts.join(" — ");
+}
+
 /**
  * For every product-scoped live offer whose minimum is above one unit price,
  * the quantity that unlocks it and what the customer would actually pay.
+ * The available stock is respected: an offer the stock can never reach is
+ * marked unreachable so the agent never dangles an impossible discount.
  */
 export function computeOfferUpsells(
   offers: OfferRow[],
@@ -67,6 +91,8 @@ export function computeOfferUpsells(
     const units = Math.ceil(min / unit);
     const subtotal = round2(unit * units);
     const discount = discountFor(o, subtotal);
+    const stockRaw = p.stock == null ? null : Number(p.stock);
+    const stock = stockRaw != null && Number.isFinite(stockRaw) ? stockRaw : null;
     out.push({
       offer_id: o.id,
       title: o.title || "عرض",
@@ -78,6 +104,9 @@ export function computeOfferUpsells(
       subtotal_at_units: subtotal,
       discount_at_units: discount,
       total_at_units: round2(subtotal - discount),
+      stock_available: stock,
+      reachable: stock == null ? true : stock >= units,
+      usage_note: usageNoteFor(o),
     });
   }
   return out;
@@ -98,21 +127,37 @@ export function buildOfferUpsellBlock(
 ): string {
   if (!upsells.length) return "";
   const cur = currency ? ` ${currency}` : "";
-  const lines = upsells.map(
-    (u) =>
+  const lines = upsells.map((u) => {
+    const stockTxt =
+      u.stock_available == null
+        ? ""
+        : ` المتاح في المخزن الآن: ${u.stock_available} قطعة.`;
+    const reach = u.reachable
+      ? ""
+      : " المخزن الحالي لا يكفي للوصول للحد الأدنى — ممنوع تعرض العرض ده على العميل أو تلمّح له.";
+    return (
       `- «${u.title}» على ${u.product_name}: سعر القطعة ${u.unit_price}${cur}، الحد الأدنى ${u.min_order_total}${cur} على قيمة نفس المنتج وحده.` +
-      ` أقل كمية توصل للحد الأدنى: ${u.units_for_minimum} قطعة = ${u.subtotal_at_units}${cur}، الخصم ${u.discount_at_units}${cur}، المدفوع ${u.total_at_units}${cur}.` +
-      ` قطعة واحدة (${u.unit_price}${cur}) لا تستحق الخصم.`,
-  );
+      ` أقل كمية توصل للحد الأدنى: ${u.units_for_minimum} قطعة = ${u.subtotal_at_units}${cur}، الخصم ${u.discount_at_units}${cur}، المدفوع ${u.total_at_units}${cur}` +
+      ` (يعني توفير ${u.discount_at_units}${cur}، ومتوسط سعر القطعة يبقى ${round2(u.total_at_units / u.units_for_minimum)}${cur} بدل ${u.unit_price}${cur}).` +
+      ` شروط الاستفادة: ${u.usage_note}.` +
+      stockTxt +
+      reach +
+      ` قطعة واحدة (${u.unit_price}${cur}) لا تستحق الخصم.`
+    );
+  });
   return (
     "\n\nOFFER NEAR-MISS FACTS (محسوبة في الكود — أرقام نهائية ممنوع تعدّلها):\n" +
     lines.join("\n") +
-    "\nإلزامي: لو العميل بيسأل أو بيطلب منتج من دول بكمية أقل من الكمية المذكورة، ممنوع تسكت عن العرض." +
-    " قول له الحقيقة في جملة واحدة قصيرة: فيه عرض على المنتج ده بالحد الأدنى الفلاني، وطلبه الحالي أقل منه، ولو خد الكمية دي هيكون الخصم كذا والمدفوع كذا." +
-    " اعرضها كاختيار مرة واحدة فقط بدون أي إلحاح أو ضغط أو تكرار، ولو رفض كمّل طلبه الأصلي عادي بالسعر الكامل من غير ما تفتح الموضوع تاني." +
-    " ممنوع تقترح إضافة منتجات تانية للوصول للحد الأدنى — الحد الأدنى على نفس المنتج وحده.\n"
+    "\nمنطق ذكر العرض (مش شرط يطلب الكمية الأعلى الأول):\n" +
+    "١) أول ما تقول سعر منتج من دول — حتى لو العميل سأل عن قطعة واحدة أو بس بيسأل عن المنتج — اذكر العرض مرة واحدة في جملة قصيرة بصيغة قيمة مضافة: سعر القطعة كذا، وفيه عرض لو أخد كذا قطعة يدفع كذا ويوفّر كذا.\n" +
+    "٢) ممنوع تصيغها كشرط جاف («العرض بس لو أخدت قطعتين») — صيغها كاختيار مفيد وبسعر واضح للحالتين: طلبه الحالي بالسعر الكامل، والاختيار التاني بالخصم.\n" +
+    "٣) ممنوع تكررها أكتر من مرة في نفس المحادثة، وممنوع أي ضغط أو إلحاح؛ لو رفض أو سكت كمّل طلبه بالسعر الكامل عادي.\n" +
+    "٤) لو الكمية المطلوبة للعرض أكبر من المتاح في المخزن، ممنوع تذكر العرض أصلًا.\n" +
+    "٥) لو العرض «مرة واحدة لكل عميل» قول ده صراحة أول مرة تعرضه، عشان العميل يعرف إنه مش هيتكرر في طلب تاني.\n" +
+    "٦) ممنوع تقترح إضافة منتجات تانية للوصول للحد الأدنى — الحد الأدنى على نفس المنتج وحده.\n"
   );
 }
+
 
 export interface OrderPricingFacts {
   currency: string | null;
